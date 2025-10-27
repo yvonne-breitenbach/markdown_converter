@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-DOCX to Markdown Converter
+Document to Markdown Converter
 
-Converts DOCX files to Markdown format using the docling library.
+Converts DOCX and PDF files to Markdown format using the docling library.
+Automatically patches PDFs missing MediaBox metadata with A4 defaults.
 Reads input file paths from config.ini and processes all uncommented entries.
 """
 
@@ -10,8 +11,9 @@ import os
 import sys
 import configparser
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
+from PyPDF2 import PdfReader, PdfWriter
 from docling.document_converter import DocumentConverter, WordFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PaginatedPipelineOptions
@@ -67,12 +69,65 @@ def get_base_name(file_path: str) -> str:
     return Path(file_path).stem
 
 
-def convert_docx_to_markdown(docx_path: Path, output_base_name: str) -> Tuple[bool, str]:
+def patch_pdf_mediabox(pdf_path: Path, output_path: Path) -> Tuple[bool, str]:
     """
-    Convert a DOCX file to Markdown with image extraction.
+    Patch a PDF file by adding MediaBox metadata to pages that are missing it.
+
+    Some PDFs are malformed and missing page dimension information (MediaBox).
+    This function adds default A4 dimensions (595 x 842 points) to any pages
+    that are missing this critical metadata.
 
     Args:
-        docx_path: Path to the input DOCX file
+        pdf_path: Path to the input PDF file
+        output_path: Path where the patched PDF should be saved
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        print(f"  → Patching PDF: {pdf_path.name}")
+        reader = PdfReader(str(pdf_path))
+        writer = PdfWriter()
+
+        pages_patched = 0
+
+        for page in reader.pages:
+            # Check if the page lacks MediaBox
+            if not page.mediabox or page.mediabox.width == 0 or page.mediabox.height == 0:
+                # Set default A4 size (595 x 842 points)
+                page.mediabox.lower_left = (0, 0)
+                page.mediabox.upper_right = (595, 842)
+                pages_patched += 1
+
+            writer.add_page(page)
+
+        # Write the patched PDF
+        with open(output_path, "wb") as f:
+            writer.write(f)
+
+        if pages_patched > 0:
+            print(f"  ✓ Patched {pages_patched} page(s) with A4 MediaBox")
+            print(f"  ✓ Saved patched PDF to: {output_path.name}")
+        else:
+            print(f"  ✓ No pages needed patching")
+
+        return True, f"Patched {pages_patched} page(s)"
+
+    except Exception as e:
+        return False, f"PDF patching failed: {type(e).__name__}: {e}"
+
+
+def convert_document_to_markdown(doc_path: Path, output_base_name: str) -> Tuple[bool, str]:
+    """
+    Convert a DOCX or PDF file to Markdown with image extraction.
+
+    For PDFs with missing MediaBox metadata, this function will:
+    1. Try converting the original PDF
+    2. If MediaBox error is detected, patch the PDF with A4 defaults
+    3. Retry conversion with the patched PDF
+
+    Args:
+        doc_path: Path to the input DOCX or PDF file
         output_base_name: Base name for output files
 
     Returns:
@@ -80,19 +135,19 @@ def convert_docx_to_markdown(docx_path: Path, output_base_name: str) -> Tuple[bo
     """
     try:
         print(f"\n{'='*60}")
-        print(f"Converting: {docx_path.name}")
+        print(f"Converting: {doc_path.name}")
         print(f"{'='*60}")
 
         # Ensure output directory exists
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Configure pipeline options for DOCX with image extraction
+        # Configure pipeline options with image extraction
         print("Configuring pipeline for image extraction...")
         pipeline_options = PaginatedPipelineOptions()
         pipeline_options.generate_picture_images = True
         pipeline_options.images_scale = 2.0  # Higher resolution images
 
-        # Initialize converter with DOCX format options
+        # Initialize converter with format options
         print("Initializing document converter...")
         converter = DocumentConverter(
             format_options={
@@ -102,9 +157,38 @@ def convert_docx_to_markdown(docx_path: Path, output_base_name: str) -> Tuple[bo
             }
         )
 
-        # Convert document
+        # Track which file we're converting (original or patched)
+        file_to_convert = doc_path
+        is_pdf = doc_path.suffix.lower() == '.pdf'
+        patched_pdf_path = None
+
+        # Try converting the document
         print("Converting document...")
-        result = converter.convert(str(docx_path))
+        try:
+            result = converter.convert(str(file_to_convert))
+        except RuntimeError as e:
+            # Check if this is a PDF MediaBox error
+            if is_pdf and "could not find the page-dimensions" in str(e):
+                print("\n⚠ MediaBox error detected - PDF is missing page dimensions")
+                print("Attempting to patch PDF with A4 defaults...")
+
+                # Create patched PDF path in output directory
+                patched_pdf_path = OUTPUT_DIR / f"{output_base_name}_patched.pdf"
+
+                # Patch the PDF
+                patch_success, patch_msg = patch_pdf_mediabox(doc_path, patched_pdf_path)
+
+                if not patch_success:
+                    raise Exception(f"Failed to patch PDF: {patch_msg}")
+
+                # Retry conversion with patched PDF
+                print("\nRetrying conversion with patched PDF...")
+                file_to_convert = patched_pdf_path
+                result = converter.convert(str(file_to_convert))
+                print("✓ Conversion successful with patched PDF!")
+            else:
+                # Re-raise if it's a different error
+                raise
 
         # Save as markdown with referenced images
         # Docling will create a {basename}_artifacts directory automatically
@@ -160,7 +244,12 @@ def convert_docx_to_markdown(docx_path: Path, output_base_name: str) -> Tuple[bo
             image_files = []
             print("✓ No images found in this document")
 
-        return True, f"Successfully converted {docx_path.name} with {len(image_files)} image(s)"
+        # Build success message
+        success_msg = f"Successfully converted {doc_path.name} with {len(image_files)} image(s)"
+        if patched_pdf_path:
+            success_msg += f" (used patched PDF)"
+
+        return True, success_msg
 
     except FileNotFoundError as e:
         return False, f"File not found: {e}"
@@ -171,7 +260,7 @@ def convert_docx_to_markdown(docx_path: Path, output_base_name: str) -> Tuple[bo
 def main():
     """Main entry point for the converter."""
     print("\n" + "="*60)
-    print("DOCX to Markdown Converter")
+    print("Document to Markdown Converter")
     print("="*60)
 
     try:
@@ -200,7 +289,7 @@ def main():
                 continue
 
             base_name = get_base_name(file_name)
-            success, message = convert_docx_to_markdown(file_path, base_name)
+            success, message = convert_document_to_markdown(file_path, base_name)
 
             if success:
                 success_count += 1
